@@ -1,0 +1,40 @@
+name: Daily quant backtest run
+
+on:
+  schedule:
+    # 13:00 UTC every day (21:00 Beijing; before the US market open)
+    - cron: '0 13 * * *'
+  workflow_dispatch:  # manual "Run workflow" button for testing
+
+permissions:
+  contents: write  # needed to commit the updated DB back to the repo
+
+concurrency:
+  group: daily-quant-run
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily pipeline
+        run: python run_daily.py
+
+      - name: Commit updated database
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: daily trading_records.db update [skip ci]'
+          file_pattern: 'db/*.db'
