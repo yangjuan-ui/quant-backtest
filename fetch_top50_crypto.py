@@ -2,9 +2,13 @@
 
 Pipeline per run:
   1. CoinGecko free API /coins/markets (market_cap_desc) -> current top 50.
-  2. Map each coin to a ccxt spot pair (e.g. BTC -> BTC/USDT on Binance).
-     Coins with no liquid USDT pair are SKIPPED WITH A LOG, never fatal.
-  3. Download daily OHLCV via ccxt (rate-limit aware).
+  2. Pick a working ccxt spot exchange. GitHub-hosted runners sit on US
+     IPs, where Binance answers 451 (restricted location), so the code
+     tries US-accessible exchanges first: kraken (USDT pairs), then
+     coinbase (USD pairs), with binance kept as a last resort.
+  3. Map each coin to a spot pair on the chosen exchange (e.g. BTC/USDT).
+     Coins with no liquid pair are SKIPPED WITH A LOG, never fatal.
+  4. Download daily OHLCV via ccxt (rate-limit aware).
 
 CoinGecko free tier is rate-limited (~10-30 req/min): delays and retries
 are built in.
@@ -22,8 +26,13 @@ import requests
 log = logging.getLogger(__name__)
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-EXCHANGE_ID = "binance"
-QUOTE = "USDT"
+# (exchange_id, quote_currency) tried in order until one answers.
+# Binance is last: it 451-blocks US-based runner IPs.
+EXCHANGE_CANDIDATES: list[tuple[str, str]] = [
+    ("kraken", "USDT"),
+    ("coinbase", "USD"),
+    ("binance", "USDT"),
+]
 OHLCV_LIMIT = 400          # ~400 daily bars per symbol
 CG_DELAY = 12.0            # seconds between CoinGecko calls on 429 backoff base
 CCXT_DELAY = 0.4           # seconds between OHLCV calls (on top of ccxt rate limit)
@@ -59,15 +68,36 @@ def get_top50(vs_currency: str = "usd", per_page: int = 50,
     raise RuntimeError(f"CoinGecko top-50 fetch failed after {retries} tries: {last_err}")
 
 
-def map_to_ccxt_symbols(coins: list[dict],
-                        exchange_id: str = EXCHANGE_ID,
-                        quote: str = QUOTE) -> tuple[list[tuple[dict, str]], list[dict]]:
-    """Map CoinGecko coins to '<BASE>/<QUOTE>' spot pairs.
+def pick_exchange(candidates: list[tuple[str, str]] = EXCHANGE_CANDIDATES
+                  ) -> tuple[object, str]:
+    """Return (exchange_instance, quote) for the first reachable candidate.
+
+    Each candidate is tried with load_markets(); geo-blocked or otherwise
+    unreachable exchanges are skipped with a log line, never fatal here.
+    Raises RuntimeError only if every candidate fails.
+    """
+    last_err = None
+    for exchange_id, quote in candidates:
+        try:
+            exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+            exchange.load_markets()
+            log.info("using ccxt exchange %s (quote %s)", exchange_id, quote)
+            return exchange, quote
+        except Exception as e:  # noqa: BLE001 - any failure -> try next
+            last_err = e
+            log.warning("ccxt exchange %s unreachable (%s); trying next",
+                        exchange_id, e)
+    raise RuntimeError(f"no ccxt exchange reachable: {last_err}")
+
+
+def map_to_ccxt_symbols(coins: list[dict], exchange,
+                        quote: str) -> tuple[list[tuple[dict, str]], list[dict]]:
+    """Map CoinGecko coins to '<BASE>/<QUOTE>' spot pairs on an exchange.
 
     Returns (mapped, skipped). Skipped coins are logged, not fatal.
     """
-    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
     markets = exchange.load_markets()
+    exchange_id = getattr(exchange, "id", "?")
     mapped, skipped = [], []
     for coin in coins:
         base = str(coin.get("symbol", "")).upper()
@@ -90,15 +120,22 @@ def fetch_ohlcv(exchange, pair: str, timeframe: str = "1d",
 
 
 def build_crypto_universe(save_dir: str | Path | None = None,
-                          exchange_id: str = EXCHANGE_ID
+                          exchange_id: str | None = None
                           ) -> dict[str, pd.DataFrame]:
-    """Full pipeline -> {pair: OHLCV DataFrame}. Saves CSVs if save_dir given."""
+    """Full pipeline -> {pair: OHLCV DataFrame}. Saves CSVs if save_dir given.
+
+    exchange_id pins a single exchange (skipping the fallback chain), e.g.
+    for local testing; when None the EXCHANGE_CANDIDATES chain is used.
+    """
     coins = get_top50()
     log.info("CoinGecko returned %d coins", len(coins))
-    mapped, skipped = map_to_ccxt_symbols(coins, exchange_id)
+
+    candidates = ([(exchange_id, "USDT")] if exchange_id
+                  else EXCHANGE_CANDIDATES)
+    exchange, quote = pick_exchange(candidates)
+    mapped, skipped = map_to_ccxt_symbols(coins, exchange, quote)
     log.info("mapped %d pairs, skipped %d", len(mapped), len(skipped))
 
-    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
     universe: dict[str, pd.DataFrame] = {}
     for _, pair in mapped:
         try:
